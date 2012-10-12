@@ -1,0 +1,4 @@
+name = Job Agent
+description = Create Job Agent on registration
+core = 7.x
+package = jbbi

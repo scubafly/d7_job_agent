@@ -1,0 +1,296 @@
+<?php
+
+/*
+ * Implements hook_user_insert
+ * // wordt niet 'gecalled' ???? ... job_agent module stond uit....
+ */
+function job_agent_user_insert(&$edit, $account, $category) {
+  //debug($account);
+  db_insert('job_agent_searches')
+  ->fields( array( 'uid' => $account->uid ) )
+  ->execute();
+}
+
+/*
+ * Implements hook_cron
+ * Send email notivication of new vacancies within user search on cron job
+ */
+function job_agent_cron() {
+	$testing = TRUE;
+	// get the datetime of last run cron
+	$last_cron = variable_get('cron_last');
+
+	$job_agents = job_agent_get_job_agents();
+	
+	foreach( $job_agents as $job_agent ) {
+		if($job_agent->results) {
+			$already_mailed = explode(',', $job_agent->results);	
+		}
+		else {
+			$already_mailed = array(0=>'0');
+		}
+		
+		// load user fields only once per job agent
+		$user = user_load($job_agent->uid);
+		$user_werkweek 				= field_get_items('user', $user, 'field_werkweek');
+		$user_city 					= field_get_items('user', $user, 'field_city');
+		$user_functioncat 			= field_get_items('user', $user, 'field_functioncat');
+		$user_state 				= field_get_items('user', $user, 'field_state');
+		$user_dienstverb 			= field_get_items('user', $user, 'field_dienstverb');
+		$user_management_experience = field_get_items('user', $user, 'field_management_experience');
+
+		$vacancies = db_select('node', 'n')
+		->fields('n', array('nid') ) // fieldlist
+		->condition('n.type', 'vacature', '=') // node is vacancy
+		->condition('n.status', '1', '=') // vacancy is published
+		// TODO enable condition below to only show new vacancies instead of all
+		// ->condition('n.created', $last_cron, '>') // new vacancies since last cron
+		// ->condition('n.nid', $already_mailed, 'NOT IN') // and aren't already mailed
+		->execute()
+		->fetchAll();
+
+		if($vacancies) { // $vacancies = false on negative result
+			$tomaillist = array(); // reset tomaillist
+			foreach($vacancies as $vacancy){
+				$node = node_load($vacancy->nid);
+
+				if($testing == FALSE) {
+					if( !job_agent_search_tid_user_vacancy( $user_werkweek, $node, 'field_werkweek') ) {
+						// debug('continue');
+						continue; //break foreach loop skip to next
+					}
+
+					if( !job_agent_search_tid_user_vacancy( $user_functioncat, $node, 'field_functioncat') ) {
+						// debug('continue');
+						continue; //break foreach loop skip to next
+					}
+
+					if( !job_agent_search_tid_user_vacancy( $user_state, $node, 'field_state') ) {
+						// debug('continue');
+						continue; //break foreach loop skip to next
+					}
+
+					if( !job_agent_search_tid_user_vacancy( $user_dienstverb, $node, 'field_dienstverb') ) {
+						// debug('continue');
+						continue; //break foreach loop skip to next
+					}
+				}
+				/* disabled checks */
+				// if( !job_agent_search_tid_user_vacancy( $user_management_experience, $node, 'field_management_experience') ) {
+				// 	debug('continue');
+				// 	continue; //break foreach loop skip to next
+				// }
+
+				// if( !job_agent_search_tid_user_vacancy( $user_city, $node, 'field_city') ) {
+				// 	debug('continue');
+				// 	continue; //break foreach loop skip to next
+				// }
+
+				// if 'code' ends up here vacancy does met the user fields conditions. Start adding it to to-email vacancy
+				$tomaillist[] = $node;
+			}
+		}
+
+
+
+		if(isset($tomaillist)){ // if there are vacancies to be mailed
+			$tomaillist_ids = array(); // reset $tomaillist_ids
+			foreach ($tomaillist as $vacature) {
+				$tomaillist_ids[] = $vacature->nid;
+			}
+			job_agent_set_mailed($tomaillist_ids, $job_agent->id);
+			job_agent_send_mail($tomaillist, $user);
+		}
+	}
+}
+
+/*
+ * compare user field with node field by fieldname
+ * if 1 or more matches return true
+ * default return false
+ */
+function job_agent_search_tid_user_vacancy($user_field, $node, $fieldname){
+	// extractor function
+	$extractor = function($row) { return $row['tid']; };
+	
+	// get tids from vacancy
+	$vacancy_field = field_get_items('node', $node, $fieldname);
+	// debug($vacancy_field); // false -> field not set
+
+	$result = array_intersect(
+	    array_map($extractor, $user_field),
+	    array_map($extractor, $vacancy_field)
+	);
+
+	if( $result ) { // if one or more matches
+		return true;
+	}
+	return false;
+}
+
+/**
+ * Implement hook_mail().
+ *
+ * This hook defines a list of possible e-mail templates that this module can
+ * send. Each e-mail is given a unique identifier, or 'key'.
+ *
+ * $message comes in with some standard properties already set: 'to' address,
+ * 'from' address, and a set of default 'headers' from drupal_mail(). The goal
+ * of hook_mail() is to set the message's 'subject' and 'body' properties, as
+ * well as make any adjustments to the headers that are necessary.
+ *
+ * The $params argument is an array which can hold any additional data required
+ * to build the mail subject and body; for example, user-entered form data, or
+ * some context information as to where the mail request came from.
+ *
+ * Note that hook_mail() is not actually a hook. It is only called for a single
+ * module, the module named in the first argument of drupal_mail(). So it's
+ * a callback of a type, but not a hook.
+ */
+function job_agent_mail($key, &$message, $params) {
+	$options = array(
+		'langcode' => $message['language']->language,
+	);
+	
+	switch ($key) {
+		case 'job_agent_new_vacancy_key':
+
+			$message['subject'] = t('nieuwe vacatures gevonden op :site-name', array(':site-name' => $params['site-name']), $options);
+			// body needs to be replaced 
+			$body[] = 'Beste :username, Uw job agent heeft zojuist een nieuwe vacature gevonden op :site-name die wellicht aansluit bij jouw achtergrond en ambitie.';
+			$body[] = 'Klik op de link om de vacature te bekijken. :vacancylink';
+			$body[] = 'Om u af te melden kunt u uw job agent uitzetten in uw profiel: :jobagent_unsubscribe';
+			foreach($body as $message_body){
+				$message['body'][] = t($message_body, array(
+					':username' => $params['username'], 
+					':site-name' => $params['site-name'], 
+					':vacancylink' => $params['vacancylink'],
+					':jobagent_unsubscribe' => $params['jobagent_unsubscribe'],
+					), 
+				$options);
+			}
+			// $body = t($body, array(':username' => $params['username'], ':site-name' => $params['site-name'], ':vacaturelink' => $params['vacaturelink']), $options);
+			break;
+	}
+}
+
+/*
+ * updates job agent in database by adding the vacancies that are already mailed to $user
+ */
+function job_agent_set_mailed($vacancies, $job_agent_id) {
+	$vacancies = implode(',', $vacancies) . ',';
+
+	db_update('job_agent_searches')
+	->condition('id', $job_agent_id)
+	->expression('results', 'CONCAT(results, :newstring)', array(':newstring' => $vacancies))
+	->execute();
+}
+
+/*
+ * set up the email and call hook_mail() by calling the drupal_mail() function.
+ */
+function job_agent_send_mail($vacancies, $user) {
+	global $base_url;
+	// debug($user->uid);
+	// mailing ( posibly multiple ) vacancie(s)
+	// specify module name and template key for hook_mail
+	$module = 'job_agent';
+	$key = 'job_agent_new_vacancy_key';
+
+	// Specify to and from addressses.
+	$to = $user->mail;
+	// $language = language_default();
+	$language = user_preferred_language($user);
+	//debug($vacancies);
+	$params = array(
+		'username' => $user->name, 
+		'site-name' => variable_get('site_name', 'Drupal'), 
+	 	'vacancylink' => l(
+	 		'vacaturenaam', 
+	 		$base_url.'/node/'.$vacancies[0]->vid,
+	 		array(
+	 			'attributes' => array( 
+	 				'target'=>'blank'
+	 			) 
+	 		) 
+	 	),
+		'jobagent_unsubscribe' => l('uitschrijven', $base_url.'/user'),
+	);
+	$from = variable_get('site_mail', 'info@branche_vacatures.nl');
+	$send = TRUE; // default = TRUE can be set to FALSE to not actually send the mail and only generate it.
+
+	// call drupal_mail() here to call hook_mail()
+	
+	$result = drupal_mail($module, $key, $to, $language, $params, $from, $send ); 
+	// debug($result);
+	// if(!empty($message['result'])) {
+	// 	// $message was send
+	// }
+}
+
+/*
+ * get ids of job agents from table job_agent_searches
+ */
+function job_agent_get_job_agents() {
+	// select ids from job_agent_searches
+	$job_agents = db_select('job_agent_searches', 'j')
+		->fields('j', array('id','uid','results') )
+		->condition('enabled', '1')
+		->execute()
+		->fetchAll();
+
+	return $job_agents;
+}
+
+/*
+ * get user id based on job agent id
+ */
+function job_agent_get_uid($job_agent_id) {
+	$uid = db_select('job_agent_searches', 'j')
+		->fields('j',array('uid') )
+		->condition('id', $job_agent_id)
+		->execute()
+		->fetchField();
+	return $uid;
+}
+
+/**
+ * Implements hook_form_alter()
+ */
+function job_agent_form_alter(&$form, $form_state, $form_id) {
+	if($form_id == 'user_profile_form') {
+		
+		// get job agent value from db for user that is being edited
+		$account = $form_state['user'];
+		$job_agent = db_select('job_agent_searches', 'j')
+			->fields('j',array('enabled'))
+			->condition('uid', $account->uid)
+			->execute()
+			->fetchField();
+		
+		// add extra field job agent field
+		$form['job_agent'] = array(
+			'#title' => t('Job Agent'),
+			'#type' => 'checkbox',
+			// table: job_agent_searches field: enabled where uid = uid
+			'#default_value' => $job_agent,
+			'#description' => t('zet hier je job agent op basis van jouw profiel aan of uit.')
+		);
+		// add submit handler 'on top' of submit array instead of overwriting it leaving other submit functions there to work as well.
+		array_unshift($form['#submit'], 'job_agent_user_profile_form_submit');
+	}
+	return $form;
+}
+
+/**
+ * Custom submit handler to be added to user_profile_form
+ * saves job_agent field to job_agent database for the user that is being edited.
+ */
+function job_agent_user_profile_form_submit($form, &$form_state) {
+	$account = $form_state['user'];
+	// save job agent field to the db here.
+	db_update('job_agent_searches')
+		->condition('uid', $account->uid)
+		->expression('enabled',':enabled', array(':enabled' => $form_state['values']['job_agent']))
+		->execute();
+}
